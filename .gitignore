@@ -1,12 +1,20 @@
-# build intermediates
-.vscode/
+# build
 build/
-
-# profiling tools
-*.sqlite
+*.o
+*.so
+*.a
+# model weights (never commit)
+*.yalm
+*.safetensors
+*.bin
+*.gguf
+models/
+# profiling / job output
 *.nsys-rep
-*.ncu-rep
-perf.data*
-*.gputrace/
-
-**/.DS_Store
+*.qdrep
+*.sqlite
+slurm-*.out
+*.log
+# misc
+.DS_Store
+.vscode/

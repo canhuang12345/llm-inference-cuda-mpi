@@ -8,6 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// Forward declaration of the MPI helper. dist.h pulls in <mpi.h> which we
+// don't want to expose to nvcc; the symbol is linked from dist.cpp.
+namespace dist {
+void allreduce_sum_f32(float* device_ptr, int count);
+}
+
 #define FULL_MASK 0xffffffff
 
 #define CUDA_CHECK(x)                                                                                    \
@@ -223,10 +229,25 @@ inline float matmul_row(const float* row, const float* x, int offset, int dim) {
 
 __device__
 inline float matmul_row(const half* row, const float* x, int offset, int dim) {
-  float sum = 0.0;
-  for (int j = offset; j < dim; j += warpSize) {
-    float v = __half2float(row[j]) * x[j];
-    sum += v;
+  // half2-vectorized dot product.
+  // Each lane processes pairs of halves at a time via 32-bit half2 loads,
+  // halving the number of weight memory instructions vs scalar half loads.
+  // Lane `offset` covers element pairs at positions:
+  //   2*offset, 2*offset+1, 2*offset+2*warpSize, 2*offset+2*warpSize+1, ...
+  // Each iteration issues one 32-bit weight load and one 64-bit x load.
+  // PRECOND: weight row is 4-byte aligned (true for cudaMalloc'd FP16 arrays
+  // as long as `dim` is even — which is always the case for transformer dims).
+  float sum = 0.0f;
+  int dim_pair = dim >> 1;
+  for (int j = offset; j < dim_pair; j += warpSize) {
+    half2 w_pair  = *((const half2*)&row[2 * j]);
+    float2 w_f    = __half22float2(w_pair);
+    float2 x_pair = *((const float2*)&x[2 * j]);
+    sum += w_f.x * x_pair.x + w_f.y * x_pair.y;
+  }
+  // Scalar tail if dim is odd. Lane 0 handles it.
+  if ((dim & 1) && offset == 0) {
+    sum += __half2float(row[dim - 1]) * x[dim - 1];
   }
   return warp_reduce_sum(sum);
 }
@@ -265,6 +286,16 @@ void matmul_wide(const T* A, const float* x, int n, int d, float* out) {
     int block_start_i = blockIdx.x * blockDim.x / warpSize;
     out[block_start_i + k] = rowSum;
   }
+}
+
+// In-place add: x[i] += y[i]. Used in the TP path to fold the all-reduced
+// row-parallel matmul output (wo or w2) back into the residual stream after
+// the cross-rank reduction. Cannot fuse with matmul like
+// fused_matmul_add_residuals does because the all-reduce sits in between.
+__global__
+void add_inplace(float* x, const float* y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] += y[i];
 }
 
 template <typename T>
@@ -522,19 +553,182 @@ void att_mix(
   }
 }
 
+// FlashAttention for autoregressive decode.
+//
+// Single Q vector per head attends over kv_len cached K/V vectors. The full
+// attention pipeline (Q·K -> softmax -> A·V) is fused into one kernel using
+// the online softmax trick, eliminating the n_heads x kv_len score matrix
+// in HBM.
+//
+// Launch geometry:
+//   grid:  (n_heads,)
+//   block: (warpSize,)             - one warp per head
+//   smem:  (2 * head_dim + warpSize) * sizeof(float)
+//
+// Shared memory layout per block:
+//   q_sm[head_dim]    - Q vector
+//   o_sm[head_dim]    - online output accumulator
+//   scores[warpSize]  - per-tile softmax weights (broadcast across lanes)
+__global__
+void flash_attention_decode(
+  const half* kb,           // (max_pages, KV_PAGE_SIZE, n_kv_heads, head_dim)
+  const half* vb,           // (max_pages, KV_PAGE_SIZE, n_kv_heads, head_dim)
+  const float* q,           // (n_heads, head_dim)
+  int head_dim,
+  int kv_len,
+  int max_seq_len,          // unused; kept for kernel-signature symmetry
+  int n_heads,
+  int n_kv_heads,
+  float* out,               // (n_heads, head_dim)
+  const int* page_table     // (max_pages,) logical -> physical page id
+) {
+  int h = blockIdx.x;
+  if (h >= n_heads) return;
+
+  int group_size = n_heads / n_kv_heads;
+  int kv_head = h / group_size;
+  int kv_stride = n_kv_heads * head_dim;
+
+  int lane = threadIdx.x;
+
+  extern __shared__ float smem[];
+  float* q_sm   = smem;
+  float* o_sm   = q_sm + head_dim;
+  float* scores = o_sm + head_dim;
+
+  // Load Q into shared memory and zero O.
+  for (int i = lane; i < head_dim; i += warpSize) {
+    q_sm[i] = q[h * head_dim + i];
+    o_sm[i] = 0.0f;
+  }
+  __syncwarp();
+
+  // Online softmax running state.
+  float m_max = -FLT_MAX;
+  float l_sum = 0.0f;
+
+  const float inv_sqrt_d = rsqrtf((float)head_dim);
+
+  // Process kv_len tokens in tiles of warpSize.
+  for (int tile_start = 0; tile_start < kv_len; tile_start += warpSize) {
+    int t = tile_start + lane;
+    int tile_size = min((int)warpSize, kv_len - tile_start);
+
+    // Each lane computes one Q·K[t] dot product.
+    // Uses half2-vectorized K reads + float2 Q reads — half the memory
+    // instructions vs scalar (head_dim is always even for transformer models).
+    // K is fetched via the page table: logical t -> physical slot.
+    float score = -FLT_MAX;
+    if (lane < tile_size) {
+      int t_page = t / KV_PAGE_SIZE;
+      int t_slot = t - t_page * KV_PAGE_SIZE;
+      int phys_t = page_table[t_page] * KV_PAGE_SIZE + t_slot;
+      const half* k_row = kb + phys_t * kv_stride + kv_head * head_dim;
+      float s = 0.0f;
+      int head_dim_pair = head_dim >> 1;
+      for (int i = 0; i < head_dim_pair; i++) {
+        half2 k_pair  = *((const half2*)&k_row[2 * i]);
+        float2 k_f    = __half22float2(k_pair);
+        float2 q_pair = *((const float2*)&q_sm[2 * i]);
+        s += k_f.x * q_pair.x + k_f.y * q_pair.y;
+      }
+      score = s * inv_sqrt_d;
+    }
+
+    // Online softmax: update running max, rescale running sum and O, accumulate.
+    float tile_max  = warp_all_reduce_max(score);
+    float new_max   = max(m_max, tile_max);
+    float exp_score = (lane < tile_size) ? __expf(score - new_max) : 0.0f;
+    float tile_sum  = warp_all_reduce_sum(exp_score);
+    float correction = __expf(m_max - new_max);
+    l_sum = l_sum * correction + tile_sum;
+    m_max = new_max;
+
+    // Stash per-lane exp_score so all lanes can read them when mixing V.
+    scores[lane] = exp_score;
+    __syncwarp();
+
+    // Update O: O[i] = O[i] * correction + Σ_t scores[t] * V[t][i].
+    // Pair-stride: lane t owns head_dim pairs (2t, 2t+1, 2t+2*warpSize, ...).
+    // Each iteration does one half2 V load and one float2 O accumulator load.
+    // V is fetched via the page table per t.
+    int head_dim_pair = head_dim >> 1;
+    for (int i_pair = lane; i_pair < head_dim_pair; i_pair += warpSize) {
+      int i = 2 * i_pair;
+      float2 acc;
+      acc.x = o_sm[i]     * correction;
+      acc.y = o_sm[i + 1] * correction;
+      for (int t_idx = 0; t_idx < tile_size; t_idx++) {
+        int t_pos  = tile_start + t_idx;
+        int t_page = t_pos / KV_PAGE_SIZE;
+        int t_slot = t_pos - t_page * KV_PAGE_SIZE;
+        int phys_t = page_table[t_page] * KV_PAGE_SIZE + t_slot;
+        const half* v_row = vb + phys_t * kv_stride + kv_head * head_dim;
+        half2 v_pair = *((const half2*)&v_row[i]);
+        float2 v_f   = __half22float2(v_pair);
+        acc.x += scores[t_idx] * v_f.x;
+        acc.y += scores[t_idx] * v_f.y;
+      }
+      *((float2*)&o_sm[i]) = acc;
+    }
+    __syncwarp();
+  }
+
+  // Final normalization: out = O / l_sum
+  float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
+  for (int i = lane; i < head_dim; i += warpSize) {
+    out[h * head_dim + i] = o_sm[i] * inv_l;
+  }
+}
+
 __global__
 void rmsnorm(const float* x, const float* weight, int size, float eps, float* out) {
-  // PRECOND: only one 1-D block is launched
-  float rms = 0.0;
+  // PRECOND: only one 1-D block is launched.
+  //
+  // When `size` is a multiple of 4 and pointers are 16B-aligned (always true for
+  // tensors allocated via cudaMalloc), we use 128-bit float4 loads/stores to halve
+  // the number of memory instructions in both passes.
   int offset = threadIdx.x;
-  for (int i = offset; i < size; i += blockDim.x) {
-    rms += x[i] * x[i];
-  }
-  rms = block_all_reduce_sum(rms);
-  rms = sqrtf(rms / size + eps);
-  float scale = 1.0 / rms;
-  for (int i = offset; i < size; i += blockDim.x) {
-    out[i] = x[i] * scale * weight[i];
+  int block_dim = blockDim.x;
+  float rms = 0.0f;
+
+  bool vec4_ok =
+      (size % 4 == 0) &&
+      (reinterpret_cast<uintptr_t>(x) % 16 == 0) &&
+      (reinterpret_cast<uintptr_t>(weight) % 16 == 0) &&
+      (reinterpret_cast<uintptr_t>(out) % 16 == 0);
+
+  if (vec4_ok) {
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    int size4 = size / 4;
+    for (int i = offset; i < size4; i += block_dim) {
+      float4 v = x4[i];
+      rms += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    rms = block_all_reduce_sum(rms);
+    float scale = rsqrtf(rms / size + eps);
+
+    const float4* w4 = reinterpret_cast<const float4*>(weight);
+    float4* out4 = reinterpret_cast<float4*>(out);
+    for (int i = offset; i < size4; i += block_dim) {
+      float4 v = x4[i];
+      float4 w = w4[i];
+      float4 r;
+      r.x = v.x * scale * w.x;
+      r.y = v.y * scale * w.y;
+      r.z = v.z * scale * w.z;
+      r.w = v.w * scale * w.w;
+      out4[i] = r;
+    }
+  } else {
+    for (int i = offset; i < size; i += block_dim) {
+      rms += x[i] * x[i];
+    }
+    rms = block_all_reduce_sum(rms);
+    float scale = rsqrtf(rms / size + eps);
+    for (int i = offset; i < size; i += block_dim) {
+      out[i] = x[i] * scale * weight[i];
+    }
   }
 }
 
@@ -546,9 +740,11 @@ inline void rope(
   if (j_head < head_dim - 1) {  // Ensure we have a pair of elements
     float freq = j_head >= rotary_dim ? 0.f : 1.0f / powf(theta, (float)j_head / (float)rotary_dim);
     float val = pos * freq;
-    float fcr = cosf(val);
-    float fci = sinf(val);
-    
+    // __sincosf computes sin+cos in one SFU instruction — about 2x faster
+    // than separate cosf/sinf calls and still fast-math-accurate enough for RoPE.
+    float fcr, fci;
+    __sincosf(val, &fci, &fcr);
+
     float2 v01 = *((float2*)&x[pair_idx]);
     float2 result = make_float2(
       v01.x * fcr - v01.y * fci,
@@ -566,9 +762,9 @@ inline void rope(
   if (j_head < head_dim - 1) {  // Ensure we have a pair of elements
     float freq = j_head >= rotary_dim ? 0.f : 1.0f / powf(theta, (float)j_head / (float)rotary_dim);
     float val = pos * freq;
-    float fcr = cosf(val);
-    float fci = sinf(val);
-    
+    float fcr, fci;
+    __sincosf(val, &fci, &fcr);
+
     float2 v01 = *((float2*)&x[pair_idx]);
     half2 result = __floats2half2_rn(
       v01.x * fcr - v01.y * fci,
@@ -586,9 +782,9 @@ inline void rope(
   if (j_head < head_dim - 1) {  // Ensure we have a pair of elements
     float freq = j_head >= rotary_dim ? 0.f : 1.0f / powf(theta, (float)j_head / (float)rotary_dim);
     float val = pos * freq;
-    float fcr = cosf(val);
-    float fci = sinf(val);
-    
+    float fcr, fci;
+    __sincosf(val, &fci, &fcr);
+
     float2 v01 = __half22float2(*((half2*)&x[pair_idx]));
     half2 result = __floats2half2_rn(
       v01.x * fcr - v01.y * fci,
@@ -662,43 +858,51 @@ void fused_rope_and_cache_update(
   const float* q,         // (n_heads * head_dim,)
   const float* k,         // (n_kv_heads * head_dim,)
   const float* v,         // (n_kv_heads * head_dim,)
-  int head_dim,          
+  int head_dim,
   int n_heads,
   int n_kv_heads,
-  int pos,               // current position
-  int kv_pos,           // position in KV cache
-  float theta,          // RoPE theta parameter
-  int rotary_dim,       // how many dimensions to rotate
-  float* q_out,         // (n_heads * head_dim,)
-  half* kb,            // (max_seq_len, n_kv_heads, head_dim)
-  half* vb            // (max_seq_len, n_kv_heads, head_dim)
+  int pos,                // current position
+  int kv_pos,             // logical position in KV cache (ring-buffer adjusted)
+  float theta,            // RoPE theta parameter
+  int rotary_dim,         // how many dimensions to rotate
+  float* q_out,           // (n_heads * head_dim,)
+  half* kb,               // (max_pages, KV_PAGE_SIZE, n_kv_heads, head_dim)
+  half* vb,               // (max_pages, KV_PAGE_SIZE, n_kv_heads, head_dim)
+  const int* page_table   // (max_pages,) logical -> physical page id
 ) {
+  // Resolve logical kv_pos through the page table to a physical storage slot.
+  // Done once per kernel launch — broadcast through all threads via the kernel
+  // launch parameter. Each thread does an L1-hot indirect load on page_table.
+  int kv_page  = kv_pos / KV_PAGE_SIZE;
+  int kv_slot  = kv_pos - kv_page * KV_PAGE_SIZE;
+  int phys_kv  = page_table[kv_page] * KV_PAGE_SIZE + kv_slot;
+
   // Each thread handles two consecutive elements (for RoPE complex rotation)
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int pair_idx = tid * 2;
-  
-  // Handle Q matrix RoPE
+
+  // Handle Q matrix RoPE (Q is not cached, no page table needed)
   if (pair_idx < n_heads * head_dim) {
     rope(
-      q, pair_idx, head_dim, pos, 
+      q, pair_idx, head_dim, pos,
       theta, rotary_dim, q_out
     );
   }
-  
-  // Handle K matrix RoPE and cache update
+
+  // Handle K matrix RoPE and cache update — write to physical slot
   if (pair_idx < n_kv_heads * head_dim) {
-    half* k_out = &kb[kv_pos * (n_kv_heads * head_dim)];
+    half* k_out = &kb[phys_kv * (n_kv_heads * head_dim)];
     rope(
-      k, pair_idx, head_dim, pos, 
+      k, pair_idx, head_dim, pos,
       theta, rotary_dim, k_out
     );
   }
-  
+
   // Handle V cache update (no RoPE needed)
   if (pair_idx < n_kv_heads * head_dim) {
-    int cache_idx = kv_pos * (n_kv_heads * head_dim) + pair_idx;
+    int cache_idx = phys_kv * (n_kv_heads * head_dim) + pair_idx;
     if (pair_idx < n_kv_heads * head_dim - 1) {
-      vb[cache_idx] = __float2half(v[pair_idx]);
+      vb[cache_idx]     = __float2half(v[pair_idx]);
       vb[cache_idx + 1] = __float2half(v[pair_idx + 1]);
     }
   }
@@ -788,6 +992,7 @@ void Block::_block_cuda(
     float* q = s.q();
     float* k = s.k();
     float* v = s.v();
+    int* pt = _page_table;
     void* kernelParams[] = {
       &q,
       &k,
@@ -801,7 +1006,8 @@ void Block::_block_cuda(
       (void*)&c.rotary_dim,
       &q,           // Q can be updated in-place
       &kb,
-      &vb
+      &vb,
+      &pt
     };
     params.kernelParams = kernelParams;
     params.extra = nullptr;
@@ -832,85 +1038,38 @@ void Block::_block_cuda(
     s.graph().add_or_update_kernel_node(fmt::format("{}:rotate_sink_tokens", _layer_i), params, s.stream());
   }
   
-  // multihead attention: dot products and softmax
+  // FlashAttention: fuses QK / softmax / AV into one kernel. Replaces the
+  // attn_dot + attn_softmax + att_mix trio. Score matrix never hits HBM.
+  //
+  // Layout:
+  //   grid (n_heads,)  block (warpSize,)
+  //   smem = (2*head_dim + warpSize) floats
   {
-    dim3 tpb;
-    tpb.x = warp_size;
-    tpb.y = c.n_heads / c.n_kv_heads;
-    dim3 blocks;
-    blocks.x = (kv_len + tpb.x - 1) / tpb.x;
-    blocks.y = (c.n_heads + tpb.y - 1) / tpb.y;
-
-    {
-      cudaKernelNodeParams params;
-      params.blockDim = tpb;
-      params.gridDim = blocks;
-      params.sharedMemBytes = 0;
-      params.func = reinterpret_cast<void*>(attn_dot);
-      float* q = s.q();
-      float* att = s.att();
-      void* kernelParams[] = {
-        &kb,
-        &q,
-        (void*)&c.head_dim,
-        &kv_len,
-        (void*)&c.max_seq_len,
-        (void*)&c.n_heads,
-        (void*)&c.n_kv_heads,
-        &att
-      };
-      params.kernelParams = kernelParams;
-      params.extra = nullptr;
-      s.graph().add_or_update_kernel_node(fmt::format("{}:attn_dot", _layer_i), params, s.stream());
-    }
-
-    {
-      cudaKernelNodeParams params;
-      params.blockDim = {static_cast<unsigned int>(warp_size), 1, 1};
-      params.gridDim = {static_cast<unsigned int>(c.n_heads), 1, 1};
-      params.sharedMemBytes = 0;
-      params.func = reinterpret_cast<void*>(attn_softmax);
-      float* att = s.att();
-      void* kernelParams[] = {
-        &att,
-        &kv_len,
-        (void*)&c.max_seq_len,
-        (void*)&c.n_heads,
-        &att
-      };
-      params.kernelParams = kernelParams;
-      params.extra = nullptr;
-      s.graph().add_or_update_kernel_node(fmt::format("{}:attn_softmax", _layer_i), params, s.stream());
-    }
-  }
-  // multihead attention: mix values with attention scores
-  {
-    dim3 tpb;
-    tpb.x = warp_size;
-    tpb.y = min(kv_len, max_threads_per_block / warp_size);
-    dim3 blocks;
-    blocks.x = c.n_heads;
+    int shared_bytes = (2 * c.head_dim + warp_size) * (int)sizeof(float);
 
     cudaKernelNodeParams params;
-    params.blockDim = tpb;
-    params.gridDim = blocks;
-    params.sharedMemBytes = 0;
-    params.func = reinterpret_cast<void*>(att_mix);
-    float* att = s.att();
+    params.blockDim = {static_cast<unsigned int>(warp_size), 1, 1};
+    params.gridDim = {static_cast<unsigned int>(c.n_heads), 1, 1};
+    params.sharedMemBytes = static_cast<unsigned int>(shared_bytes);
+    params.func = reinterpret_cast<void*>(flash_attention_decode);
+    float* q = s.q();
     float* xb2 = s.xb2();
+    int* pt = _page_table;
     void* kernelParams[] = {
+      &kb,
       &vb,
-      &att,
+      &q,
       (void*)&c.head_dim,
-      (void*)&c.n_heads,
-      (void*)&c.n_kv_heads,
       &kv_len,
       (void*)&c.max_seq_len,
-      &xb2
+      (void*)&c.n_heads,
+      (void*)&c.n_kv_heads,
+      &xb2,
+      &pt
     };
     params.kernelParams = kernelParams;
     params.extra = nullptr;
-    s.graph().add_or_update_kernel_node(fmt::format("{}:att_mix", _layer_i), params, s.stream());
+    s.graph().add_or_update_kernel_node(fmt::format("{}:flash_attention", _layer_i), params, s.stream());
   }
 
   // final matmul projection and residual back:
@@ -961,6 +1120,122 @@ void Block::_block_cuda(
 #undef STATIC_KERNEL
 }
 
+// Tensor-parallel block. Same forward sequence as _block_cuda but:
+//   - All matmul launch dims use the rank-local Q/KV/hidden sizes.
+//   - Sink rotate and FlashAttention pass local head counts.
+//   - wo and w2 (row-parallel matmuls) split into matmul-into-tp_xpart,
+//     MPI_Allreduce, then add-residual. The fused_matmul_add_residuals path
+//     can't be used because the all-reduce sits between the matmul and the
+//     residual add.
+//   - No CUDA graph capture. MPI calls aren't graph-capturable, and the
+//     per-step kernel launch overhead is small compared to the inter-rank
+//     reduction at TP > 1.
+template <typename T>
+void Block::_block_cuda_dist(
+  InferenceState& s, int pos, int kv_sink, int kv_pos, int kv_len
+) const {
+  const Config& c = *_config;
+  cudaStream_t stream = s.stream();
+  const int q_dim_l      = c.q_dim_local;
+  const int kv_dim_l     = c.kv_dim_local;
+  const int hidden_l     = c.hidden_dim_local;
+  const int n_heads_l    = c.n_heads_local;
+  const int n_kv_heads_l = c.n_kv_heads_local;
+
+  // attention pre-norm — input x is identical on every rank (replicated
+  // residual stream), so RMSNorm runs locally with no comm.
+  rmsnorm<<<1, max_threads_per_block, 0, stream>>>(
+    s.x(), rms_att_weight(), c.dim, c.norm_eps, s.xb()
+  );
+
+  // qkv matmuls on the local head slice.
+  {
+    int total_rows = q_dim_l + 2 * kv_dim_l;
+    fused_qkv_matmul_clip<<<total_rows, warp_size, 0, stream>>>(
+      wq<T>(), wk<T>(), wv<T>(), s.xb(),
+      c.dim, q_dim_l, kv_dim_l, c.qkv_clip,
+      s.q(), s.k(), s.v()
+    );
+  }
+
+  // RoPE + write into the local KV cache slice.
+  half* kb = (half*)key_cache();
+  half* vb = (half*)value_cache();
+  {
+    int max_dim = max(q_dim_l, kv_dim_l);
+    int threads_needed = (max_dim + 1) / 2;
+    int num_blocks = (threads_needed + max_threads_per_block - 1) / max_threads_per_block;
+    fused_rope_and_cache_update<<<num_blocks, max_threads_per_block, 0, stream>>>(
+      s.q(), s.k(), s.v(),
+      c.head_dim, n_heads_l, n_kv_heads_l,
+      pos, kv_pos, c.rope_theta, c.rotary_dim,
+      s.q(), kb, vb, _page_table
+    );
+  }
+  {
+    int threads_needed = (kv_dim_l + 1) / 2;
+    int num_blocks = (threads_needed + max_threads_per_block - 1) / max_threads_per_block;
+    rotate_sink_tokens<<<num_blocks, max_threads_per_block, 0, stream>>>(
+      kb, kv_sink, kv_dim_l, c.head_dim, c.rope_theta, c.rotary_dim
+    );
+  }
+
+  // FlashAttention over the local heads only — every Q head on this rank
+  // owns its K/V slice (the KV-head split lines up with the Q-head split).
+  {
+    int shared_bytes = (2 * c.head_dim + warp_size) * (int)sizeof(float);
+    flash_attention_decode<<<n_heads_l, warp_size, shared_bytes, stream>>>(
+      kb, vb, s.q(),
+      c.head_dim, kv_len, c.max_seq_len, n_heads_l, n_kv_heads_l,
+      s.xb2(), _page_table
+    );
+  }
+
+  // wo row-parallel: matmul -> all-reduce -> add residual.
+  // Local input dim is q_dim_l; output dim is full c.dim.
+  matmul_wide<<<c.dim/32, warp_size*32, 0, stream>>>(
+    wo<T>(), s.xb2(), q_dim_l, c.dim, s.tp_xpart()
+  );
+  // MPI_Allreduce needs the kernel to be done. CUDA-aware MPI does not
+  // synchronize with the CUDA stream; we sync explicitly here.
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  dist::allreduce_sum_f32(s.tp_xpart(), c.dim);
+  add_inplace<<<(c.dim + 255)/256, 256, 0, stream>>>(s.x(), s.tp_xpart(), c.dim);
+
+  // ffn pre-norm — same situation as attn pre-norm; x is identical post-reduce.
+  rmsnorm<<<1, max_threads_per_block, 0, stream>>>(
+    s.x(), rms_ffn_weight(), c.dim, c.norm_eps, s.xb()
+  );
+
+  if (c.n_experts > 0) {
+    assert(false && "Mixture of experts not yet supported in TP path");
+  }
+
+  // GLU FFN on the local hidden slice.
+  switch (c.act) {
+    case ActivationType::GELU: {
+      fused_ffn_w1_w3_glu_act<T, ActivationType::GELU><<<
+        hidden_l, warp_size, 0, stream
+      >>>(w1<T>(), w3<T>(), s.xb(), c.dim, hidden_l, s.hb());
+      break;
+    }
+    case ActivationType::SILU: {
+      fused_ffn_w1_w3_glu_act<T, ActivationType::SILU><<<
+        hidden_l, warp_size, 0, stream
+      >>>(w1<T>(), w3<T>(), s.xb(), c.dim, hidden_l, s.hb());
+      break;
+    }
+  }
+
+  // w2 row-parallel: same matmul -> all-reduce -> add residual pattern.
+  matmul_wide<<<c.dim/32, warp_size*32, 0, stream>>>(
+    w2<T>(), s.hb(), hidden_l, c.dim, s.tp_xpart()
+  );
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  dist::allreduce_sum_f32(s.tp_xpart(), c.dim);
+  add_inplace<<<(c.dim + 255)/256, 256, 0, stream>>>(s.x(), s.tp_xpart(), c.dim);
+}
+
 void mha_cuda(
   float* xout,  // (n_heads, head_dim)
   float* att,   // (n_heads, max_seq_len)
@@ -1009,6 +1284,44 @@ void mha_cuda(
   CUDA_CHECK(cudaGetLastError()); // check for kernel launch errors
   unregister_cuda_host(xout);
   unregister_cuda_host(att);
+}
+
+// Test-only wrapper that runs the fused FlashAttention path. Mirrors mha_cuda
+// but routes through flash_attention_decode so test.cpp can validate numerics
+// against mha_cpu independently of the rest of the inference pipeline.
+void mha_cuda_flash(
+  float* xout,  // (n_heads, head_dim)
+  f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim) — flat contiguous from test
+  f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
+  float* q,     // (n_heads, head_dim)
+  int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
+) {
+  int warp_size = 32;
+  register_cuda_host(xout, n_heads * head_dim * sizeof(float));
+  kb = static_cast<f16_t*>(upload_cuda(kb, max_seq_len * n_kv_heads * head_dim * sizeof(f16_t)));
+  vb = static_cast<f16_t*>(upload_cuda(vb, max_seq_len * n_kv_heads * head_dim * sizeof(f16_t)));
+  q  = static_cast<float*>(upload_cuda(q,  n_heads * head_dim * sizeof(float)));
+
+  // Test passes a flat (max_seq_len, ...) layout, so synthesize an identity
+  // page table here to make the paged-kernel see the same byte addresses as
+  // before. max_seq_len must be a multiple of KV_PAGE_SIZE for this to be
+  // exact — guaranteed for the test sizes (max_seq_len=4 isn't, but with
+  // identity page_table[0]=0 the only page used is page 0, so any
+  // KV_PAGE_SIZE >= max_seq_len works the same).
+  int n_pages = (max_seq_len + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE;
+  std::vector<int> identity(n_pages);
+  for (int i = 0; i < n_pages; ++i) identity[i] = i;
+  int* page_table = static_cast<int*>(upload_cuda(identity.data(), n_pages * sizeof(int)));
+
+  int shared_bytes = (2 * head_dim + warp_size) * (int)sizeof(float);
+  flash_attention_decode<<<n_heads, warp_size, shared_bytes, cudaStreamLegacy>>>(
+    (half*)kb, (half*)vb, q,
+    head_dim, kv_len, max_seq_len, n_heads, n_kv_heads,
+    xout, page_table
+  );
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
+  unregister_cuda_host(xout);
 }
 
 template <typename T>
@@ -1098,6 +1411,90 @@ template void Block::_block_cuda<float>(InferenceState&, int, int, int, int) con
 template void Block::_block_cuda<half>(InferenceState&, int, int, int, int) const;
 template<> void Block::_block_cuda<f16_t>(InferenceState& s, int pos, int kv_sink, int kv_pos, int kv_len) const {
   _block_cuda<half>(s, pos, kv_sink, kv_pos, kv_len);
+}
+
+template void Block::_block_cuda_dist<float>(InferenceState&, int, int, int, int) const;
+template void Block::_block_cuda_dist<half>(InferenceState&, int, int, int, int) const;
+template<> void Block::_block_cuda_dist<f16_t>(InferenceState& s, int pos, int kv_sink, int kv_pos, int kv_len) const {
+  _block_cuda_dist<half>(s, pos, kv_sink, kv_pos, kv_len);
+}
+
+// Tensor-parallel forward pass. Same operation sequence as
+// _forward_cuda_build_graph but kernels are dispatched directly (no CUDA
+// graph) and the per-layer Block calls go through Block::block, which
+// dispatches to _block_cuda_dist when tp_size > 1.
+//
+// wcls is currently replicated, so every rank computes the full logits
+// vector — sampling is deterministic across ranks given the same seed, and
+// no token broadcast is needed. (See plan doc for the column-parallel wcls
+// alternative; deferred.)
+void Model::_forward_cuda_dist(InferenceState& s, int token, int pos, InferenceMode mode) {
+  const Config& c = *config;
+  cudaStream_t stream = s.stream();
+  s.set_mode(mode);
+
+  // copy embedding
+  int block_dim = max_threads_per_block;
+  int grid_dim = (c.dim + block_dim - 1) / block_dim;
+  switch (c.weight_dtype) {
+    case DType::F32: {
+      copy_embedding_float<<<grid_dim, block_dim, 0, stream>>>(
+        static_cast<float*>(token_embedding_table), c.dim, token, s.x()
+      );
+      break;
+    }
+    case DType::F16: {
+      copy_embedding_half<<<grid_dim, block_dim, 0, stream>>>(
+        static_cast<half*>(token_embedding_table), c.dim, token, s.x()
+      );
+      break;
+    }
+    default: {
+      assert(false && "unsupported weight dtype for CUDA");
+    }
+  }
+
+  int kv_sink = pos >= c.max_seq_len ? KV_SINKS : 0;
+  int kv_pos  = kv_sink + (pos - kv_sink) % (c.max_seq_len - kv_sink);
+  int kv_len  = pos >= c.max_seq_len ? c.max_seq_len : pos + 1;
+
+  // Forward all layers. Block::block() routes to _block_cuda_dist because
+  // _config->tp_size > 1.
+  for (auto& b : blocks) {
+    b->block(s, pos, kv_sink, kv_pos, kv_len);
+  }
+
+  if (mode == InferenceMode::HYDRATE_KV_CACHE) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
+
+  // final layer norm
+  rmsnorm<<<1, max_threads_per_block, 0, stream>>>(
+    s.x(), rms_final_weight, c.dim, c.norm_eps, s.x()
+  );
+
+  // classifier into logits — wcls replicated, full vocab on every rank.
+  switch (c.weight_dtype) {
+    case DType::F32: {
+      matmul_wide<<<c.vocab_size/32, warp_size*32, 0, stream>>>(
+        static_cast<float*>(wcls), s.x(), c.dim, c.vocab_size, s.logits()
+      );
+      break;
+    }
+    case DType::F16: {
+      matmul_wide<<<c.vocab_size/32, warp_size*32, 0, stream>>>(
+        static_cast<half*>(wcls), s.x(), c.dim, c.vocab_size, s.logits()
+      );
+      break;
+    }
+    default: {
+      assert(false && "unsupported weight dtype for CUDA");
+    }
+  }
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaGetLastError());
 }
 
 void Model::_forward_cuda(InferenceState& s, int token, int pos, InferenceMode mode) {

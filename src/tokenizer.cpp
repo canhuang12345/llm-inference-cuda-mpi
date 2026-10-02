@@ -1,8 +1,17 @@
 #include "tokenizer.h"
 
+// Some HF configs (e.g. Llama 3.2) store eos_token_id as a JSON list like
+// "[128001, 128008, 128009]". Accept either a bare int or take the first
+// integer found in a bracketed list.
+static int parse_token_id(const std::string& s) {
+  size_t i = 0;
+  while (i < s.size() && !(s[i] == '-' || (s[i] >= '0' && s[i] <= '9'))) i++;
+  return std::stoi(s.substr(i));
+}
+
 Tokenizer::Tokenizer(const YALMData& data) {
-  this->bos_id = std::stoi(data.metadata.at("bos_token_id").get<std::string>());
-  this->eos_id = std::stoi(data.metadata.at("eos_token_id").get<std::string>());
+  this->bos_id = parse_token_id(data.metadata.at("bos_token_id").get<std::string>());
+  this->eos_id = parse_token_id(data.metadata.at("eos_token_id").get<std::string>());
   // TODO: figure out edge cases:
   // Q: should `vocab` include byte fallback tokens?
   // Q: should `vocab` include special tokens, e.g. '<unk>', '<s>', '</s>'?

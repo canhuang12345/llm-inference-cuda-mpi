@@ -40,9 +40,35 @@ ifneq (,$(wildcard /usr/local/cuda))
   LDFLAGS+=-L/usr/local/cuda/lib64
   CFLAGS+=-I/usr/local/cuda/include
 endif
+# NVHPC SDK lays out CUDA under $NVHPC_ROOT/cuda/{include,lib64} (and
+# $NVHPC_ROOT/cuda/<ver>/...). Pick this up when /usr/local/cuda is absent —
+# happens on clusters where CUDA ships via nvhpc rather than a
+# stand-alone install.
+ifneq (,$(NVHPC_ROOT))
+  ifneq (,$(wildcard $(NVHPC_ROOT)/cuda/include/cuda_runtime_api.h))
+    CFLAGS  += -I$(NVHPC_ROOT)/cuda/include
+    LDFLAGS += -L$(NVHPC_ROOT)/cuda/lib64
+  endif
+endif
 
 CUFLAGS+=-O2 -lineinfo -Ivendor
 CUFLAGS+=-allow-unsupported-compiler # for recent CUDA versions
+
+# MPI: extract include and link flags from mpicxx's --showme. We add them to
+# CFLAGS/CUFLAGS/LDFLAGS rather than switching CXX to mpicxx so the existing
+# benchmark.sbatch (which sets CXX=g++) keeps working.
+comma := ,
+MPI_INC_DIRS := $(shell mpicxx --showme:incdirs 2>/dev/null)
+MPI_LIB_DIRS := $(shell mpicxx --showme:libdirs 2>/dev/null)
+MPI_LIB_NAMES := $(shell mpicxx --showme:libs 2>/dev/null)
+MPI_CFLAGS := $(addprefix -I,$(MPI_INC_DIRS))
+MPI_LDFLAGS := $(addprefix -L,$(MPI_LIB_DIRS)) \
+               $(foreach d,$(MPI_LIB_DIRS),-Wl$(comma)-rpath$(comma)$(d)) \
+               $(addprefix -l,$(MPI_LIB_NAMES))
+
+CFLAGS  += $(MPI_CFLAGS)
+CUFLAGS += $(MPI_CFLAGS)
+LDFLAGS += $(MPI_LDFLAGS)
 
 ifeq ($(CUARCH),)
   CUFLAGS+=-gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90 --threads 2

@@ -154,7 +154,7 @@ void test_cuda_kernels() {
   int max_seq_len = 4;
   int kv_len = 4;
 
-  // matmul
+  // matmul (FP32 weights)
   {
     std::vector<float> w(dim * head_dim);
     fill_random(w.data(), w.size(), 0);
@@ -164,10 +164,24 @@ void test_cuda_kernels() {
     std::vector<float> xout_cuda(head_dim);
     matmul_cpu(xout_cpu.data(), x.data(), w.data(), dim, head_dim);
     matmul_cuda(xout_cuda.data(), x.data(), w.data(), dim, head_dim);
-    assertArrayEquals(xout_cuda, xout_cpu, "matmul");
+    assertArrayEquals(xout_cuda, xout_cpu, "matmul fp32");
   }
 
-  // mha
+  // matmul (FP16 weights) — exercises the half2-vectorized matmul_row path
+  {
+    std::vector<f16_t> w16(dim * head_dim);
+    fill_random(w16.data(), w16.size(), 0);
+    std::vector<float> x(dim);
+    fill_random(x.data(), x.size(), 1);
+    std::vector<float> xout_cpu(head_dim);
+    std::vector<float> xout_cuda(head_dim);
+    matmul_cpu(xout_cpu.data(), x.data(), w16.data(), dim, head_dim);
+    matmul_cuda(xout_cuda.data(), x.data(), w16.data(), dim, head_dim);
+    // FP16 weight quantization introduces some rounding error, so widen tolerance.
+    assertArrayEquals(xout_cuda, xout_cpu, "matmul fp16", 5e-3);
+  }
+
+  // mha (standard, three-kernel path)
   {
     std::vector<f16_t> kb(max_seq_len * n_kv_heads * head_dim);
     fill_random(kb.data(), kb.size(), 0);
@@ -182,21 +196,53 @@ void test_cuda_kernels() {
     mha_cpu(
       xout_cpu.data(),
       att_cpu.data(),
-      kb.data(), 
-      vb.data(), 
-      q.data(), 
+      kb.data(),
+      vb.data(),
+      q.data(),
       head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
     );
     mha_cuda(
-      xout_cuda.data(), 
+      xout_cuda.data(),
       att_cuda.data(),
-      kb.data(), 
-      vb.data(), 
-      q.data(), 
+      kb.data(),
+      vb.data(),
+      q.data(),
       head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
     );
     assertArrayEquals(att_cuda, att_cpu, "mha att");
     assertArrayEquals(xout_cuda, xout_cpu, "mha xout");
+  }
+
+  // mha (FlashAttention path)
+  {
+    std::vector<f16_t> kb(max_seq_len * n_kv_heads * head_dim);
+    fill_random(kb.data(), kb.size(), 0);
+    std::vector<f16_t> vb(max_seq_len * n_kv_heads * head_dim);
+    fill_random(vb.data(), vb.size(), 1);
+    std::vector<float> q(n_heads * head_dim);
+    fill_random(q.data(), q.size(), 2);
+    std::vector<float> att_cpu(n_heads * max_seq_len);
+    std::vector<float> xout_cpu(n_heads * head_dim);
+    std::vector<float> xout_flash(n_heads * head_dim);
+    mha_cpu(
+      xout_cpu.data(),
+      att_cpu.data(),
+      kb.data(),
+      vb.data(),
+      q.data(),
+      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
+    );
+    mha_cuda_flash(
+      xout_flash.data(),
+      kb.data(),
+      vb.data(),
+      q.data(),
+      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
+    );
+    // FlashAttention uses online softmax + __expf which has slightly less
+    // accurate exponent than expf, so relax the tolerance versus the strict
+    // 1e-4 used for the three-kernel path.
+    assertArrayEquals(xout_flash, xout_cpu, "mha flash xout", 1e-3);
   }
 
   // ffn
@@ -372,11 +418,26 @@ void kernel_bench(const std::string& kernel_name) {
     std::vector<float> att_cuda(n_heads * max_seq_len);
     std::vector<float> xout_cuda(n_heads * head_dim);
     mha_cuda(
-      xout_cuda.data(), 
+      xout_cuda.data(),
       att_cuda.data(),
-      kb.data(), 
-      vb.data(), 
-      q.data(), 
+      kb.data(),
+      vb.data(),
+      q.data(),
+      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
+    );
+  } else if (kernel_name == "mha-flash") {
+    std::vector<f16_t> kb(max_seq_len * n_kv_heads * head_dim);
+    fill_random(kb.data(), kb.size(), 0);
+    std::vector<f16_t> vb(max_seq_len * n_kv_heads * head_dim);
+    fill_random(vb.data(), vb.size(), 1);
+    std::vector<float> q(n_heads * head_dim);
+    fill_random(q.data(), q.size(), 2);
+    std::vector<float> xout_cuda(n_heads * head_dim);
+    mha_cuda_flash(
+      xout_cuda.data(),
+      kb.data(),
+      vb.data(),
+      q.data(),
       head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
     );
   } else if (kernel_name == "ffn") {

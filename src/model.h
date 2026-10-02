@@ -11,6 +11,13 @@
 
 constexpr int KV_SINKS = 2;
 
+// Paged KV cache page size (tokens per page).
+// 16 is the same default vLLM uses — small enough to limit waste from partial
+// pages, large enough that page-table lookups don't dominate.
+// max_seq_len rounds up to a whole number of pages; storage is allocated for
+// that rounded-up count.
+constexpr int KV_PAGE_SIZE = 16;
+
 enum class ActivationType {
   GELU,
   SILU,
@@ -61,8 +68,35 @@ struct Config {
   // to safety check tensor dtype at initialization time.
   DType weight_dtype;
 
+  // Tensor parallelism. tp_size == 1 means single-GPU (no sharding, no MPI
+  // collectives). When tp_size > 1, weights and KV cache shard 1/tp_size-way
+  // along the head/hidden axis (Megatron-style row+column TP). The "_local"
+  // fields are the per-rank dimensions derived from tp_size — kernels and
+  // upload paths use these throughout so single-GPU is just tp_size=1 with
+  // local == full.
+  int tp_rank = 0;
+  int tp_size = 1;
+  int n_heads_local = 0;
+  int n_kv_heads_local = 0;
+  int q_dim_local = 0;       // n_heads_local * head_dim
+  int kv_dim_local = 0;      // n_kv_heads_local * head_dim
+  int hidden_dim_local = 0;
+
+  // Accessors that return the per-rank local dim, falling back to the full
+  // dim if set_tp() has not been called yet. test.cpp constructs Config by
+  // hand without calling from_yalm/set_tp; these accessors keep that path
+  // working with tp_size=1 semantics.
+  inline int n_heads_l()    const { return n_heads_local    ? n_heads_local    : n_heads; }
+  inline int n_kv_heads_l() const { return n_kv_heads_local ? n_kv_heads_local : n_kv_heads; }
+  inline int q_dim_l()      const { return q_dim_local      ? q_dim_local      : n_heads    * head_dim; }
+  inline int kv_dim_l()     const { return kv_dim_local     ? kv_dim_local     : n_kv_heads * head_dim; }
+  inline int hidden_dim_l() const { return hidden_dim_local ? hidden_dim_local : hidden_dim; }
+
   // If nonzero `context` is supplied, max sequence length is limited to `context`.
   void from_yalm(YALMData& yalm, int context = 0);
+  // Re-derive the *_local fields for the given TP rank/size. Asserts that
+  // size divides n_heads, n_kv_heads, and hidden_dim. Call after from_yalm().
+  void set_tp(int rank, int size);
   size_t active_bytes(size_t pos) const;
 };
 
@@ -103,6 +137,10 @@ struct InferenceState {
   float* moe_weights() const { return _moe_weights; }
   float* active_experts_weights() const { return _active_experts_weights; }
   int* active_experts() const { return _active_experts; }
+  // TP path only: dim-sized device buffer that holds the local partial of a
+  // row-parallel matmul (wo or w2) before the cross-rank all-reduce. Unused
+  // when tp_size == 1.
+  float* tp_xpart() const { return _tp_xpart; }
   // LM head
   float* logits() const { return _logits; }
 
@@ -138,9 +176,11 @@ private:
   float* _moe_weights = nullptr; // (n_experts,) - buffer for expert weights, decided by router
   float* _active_experts_weights = nullptr; // (n_active_experts,) - buffer for weights of top K experts (active experts)
   int* _active_experts = nullptr; // (n_active_experts,) - buffer for indices of top K experts (active experts)
-  
+  // TP path: (dim,) device buffer for partial reductions. nullptr when tp_size == 1.
+  float* _tp_xpart = nullptr;
+
   // LM head
-  // NOTE: this always lives on the host (CPU), but must be registered 
+  // NOTE: this always lives on the host (CPU), but must be registered
   // with CUDA to be used on the device.
   float* _logits = nullptr;    // (vocab_size,) - final output logits
 };
@@ -183,9 +223,14 @@ struct Block {
   T* moegate() const { return static_cast<T*>(_moegate); }
   f16_t* key_cache() const { return _key_cache; }
   f16_t* value_cache() const { return _value_cache; }
+  // Paged-KV page table: logical_page_idx -> physical_page_idx.
+  // Initialized to identity in Block::cuda(); will be reshuffled by the
+  // page allocator in Phase 6 to enable dynamic batching.
+  int* page_table() const { return _page_table; }
+  int max_pages() const;
 
   // Compute forward pass for this block and update the inference state accordingly.
-  // PRECONDITIONS: 
+  // PRECONDITIONS:
   // - `s.x()` contains the input to the block. Output will also go here.
   // - Block KV cache is hydrated.
   void block(
@@ -215,6 +260,14 @@ private:
     int kv_pos,         // index of the current token in the kv cache, must be in [0..kv_len) since kv cache is a ring buffer
     int kv_len          // number of tokens in the kv cache that we will attend over
   ) const;
+  template <typename T>
+  void _block_cuda_dist(
+    InferenceState& s,
+    int pos,
+    int kv_sink,
+    int kv_pos,
+    int kv_len
+  ) const;
 
   int _layer_i = 0;
 
@@ -238,9 +291,15 @@ private:
   // weights for mixture of experts router if present
   void* _moegate = nullptr; // (n_experts?, dim)
 
-  // kv cache
-  f16_t* _key_cache = nullptr;   // (seq_len, n_kv_heads * head_dim)
-  f16_t* _value_cache = nullptr; // (seq_len, n_kv_heads * head_dim)
+  // kv cache — physical storage is laid out as
+  //   (max_pages, KV_PAGE_SIZE, n_kv_heads, head_dim)
+  // which is byte-equivalent to the old (max_seq_len, n_kv_heads, head_dim)
+  // layout when max_seq_len is a multiple of KV_PAGE_SIZE.
+  // Kernels index it via the page table: logical kv_pos -> physical slot.
+  f16_t* _key_cache = nullptr;
+  f16_t* _value_cache = nullptr;
+  // Page table on device: int[max_pages]. Identity until Phase 6.
+  int* _page_table = nullptr;
 };
 
 struct Model {
@@ -255,14 +314,23 @@ struct Model {
   // classifier weights for the logits, on the last layer
   void* wcls = nullptr; // (vocab_size, dim)
 
-  Model(YALMData& yalm, int context = 0);
-  
+  // tp_rank/tp_size are propagated into Config before any Block is created
+  // so KV cache and activations are allocated at the per-rank size from the
+  // start. Defaults (0, 1) preserve single-GPU behavior.
+  Model(YALMData& yalm, int context = 0, int tp_rank = 0, int tp_size = 1);
+
   void forward(InferenceState& s, int token, int pos, InferenceMode mode = InferenceMode::OUTPUT_LOGITS);
-  void cuda();
+  // device_id selects which CUDA GPU to bind this process to. In multi-GPU
+  // runs main passes dist::local_rank(); single-process callers (e.g. tests)
+  // omit the argument and stay on device 0.
+  void cuda(int device_id = 0);
 
 private:
   void _forward_cpu(InferenceState& s, int token, int pos, InferenceMode mode);
   void _forward_cuda(InferenceState& s, int token, int pos, InferenceMode mode);
+  // TP path. Mirrors _forward_cuda but skips CUDA graph capture and inserts
+  // MPI_Allreduce after the wo and w2 row-parallel matmuls in each block.
+  void _forward_cuda_dist(InferenceState& s, int token, int pos, InferenceMode mode);
   void _forward_cuda_build_graph(InferenceState& s, int token, int pos, InferenceMode mode);
   void _copy_embedding(InferenceState& s, int token);
 
@@ -315,6 +383,15 @@ void mha_cpu(
 void mha_cuda(
   float* xout,  // (n_heads, head_dim)
   float* att,   // (n_heads, max_seq_len)
+  f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
+  float* q,     // (n_heads, head_dim)
+  int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
+);
+// FlashAttention-style fused decoder MHA. No external `att` buffer needed —
+// scores and softmax are kept on-chip via online softmax.
+void mha_cuda_flash(
+  float* xout,  // (n_heads, head_dim)
   f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
   f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
   float* q,     // (n_heads, head_dim)
